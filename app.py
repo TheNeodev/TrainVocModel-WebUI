@@ -1,118 +1,128 @@
 import gradio as gr
 import os
-import re
-import numpy as np
 import subprocess
-from sklearn.cluster import MiniBatchKMeans
-from multiprocessing import cpu_count
-import traceback
-import faiss
-
+import json
+from random import shuffle
+BASE_DIR = os.getcwd()
 # Helper Functions
-def validate_model_name(name):
-    if not re.match(r'^[\w_-]+$', name):
-        return "Invalid model name: Contains invalid characters or spaces!"
-    return None
+def data_processing(model_name, dataset_folder, sample_rate, is_half, new_preprocess, percentage):
+    try:
+        sr = int(sample_rate.rstrip("k")) * 1000
+        preprocess_file = 'preprocess_custom.py' if new_preprocess else 'preprocess.py'
 
-def preprocess_dataset(model_name, dataset_folder, sample_rate, is_half, new_preprocess, percentage):
-    if not os.listdir(dataset_folder):
-        return "Dataset folder is empty!"
+        # Create logs directory for the model
+        os.makedirs(f'./logs/{model_name}', exist_ok=True)
 
-    preprocess_file = 'preprocess_custom.py' if new_preprocess else 'preprocess.py'
+        # Run the preprocessing script
+        subprocess.run(
+            [
+                "python", f"infer/modules/train/{preprocess_file}", dataset_folder, 
+                str(sr), "2", f"./logs/{model_name}", "False", str(percentage)
+            ], check=True
+        )
 
-    if new_preprocess and not os.path.isfile(f'infer/modules/train/{preprocess_file}'):
-        preprocess_file = 'preprocess.py'
+        # Check logs for successful preprocessing
+        with open(f'./logs/{model_name}/preprocess.log', 'r') as log:
+            if 'end preprocess' not in log.read():
+                raise Exception("Data preprocessing failed. Check dataset folder.")
 
-    os.makedirs(f'./logs/{model_name}', exist_ok=True)
-    with open(f'./logs/{model_name}/preprocess.log', 'w') as f:
-        subprocess.run([
-            "python", f"infer/modules/train/{preprocess_file}", dataset_folder, str(sample_rate), "2", f"./logs/{model_name}", "False", str(percentage)
-        ])
+        return f"Data processing completed for model: {model_name}"
+    except Exception as e:
+        return str(e)
 
-    with open(f'./logs/{model_name}/preprocess.log', 'r') as f:
-        log_content = f.read()
-        if 'end preprocess' in log_content:
-            return "Preprocessing complete!"
+
+def model_training(
+    model_name, sample_rate, epochs, save_epoch, pretrain, custom_pretrained, 
+    d_pretrained_link, g_pretrained_link, batch_size, fp16_run, tensorboard
+):
+    try:
+        pretrain_outpath = "/content/pretrained_models"
+        os.makedirs(pretrain_outpath, exist_ok=True)
+
+        # Handle pretrained model selection
+        if custom_pretrained and d_pretrained_link and g_pretrained_link:
+            subprocess.run(["aria2c", d_pretrained_link, "-d", pretrain_outpath], check=True)
+            subprocess.run(["aria2c", g_pretrained_link, "-d", pretrain_outpath], check=True)
+            G_file = os.path.join(pretrain_outpath, os.path.basename(g_pretrained_link))
+            D_file = os.path.join(pretrain_outpath, os.path.basename(d_pretrained_link))
         else:
-            return "Error during preprocessing. Check dataset folder and logs."
+            # Use predefined pretrained models
+            G_file = f"{pretrain_outpath}"  # Define based on your mapping logic
+            D_file = f"{pretrain_outpath}"  # Define based on your mapping logic
 
-def train_index(model_name, version):
-    try:
-        exp_dir = f"logs/{model_name}"
+        # Write training configuration
+        exp_dir = f"./logs/{model_name}"
         os.makedirs(exp_dir, exist_ok=True)
-        feature_dir = f"{exp_dir}/3_feature256" if version == "v1" else f"{exp_dir}/3_feature768"
+        config_path = f"configs/v2/{sample_rate}.json"
+        config_save_path = os.path.join(exp_dir, "config.json")
 
-        if not os.path.exists(feature_dir):
-            return "Feature extraction required before index training!"
+        with open(config_save_path, "w") as f:
+            with open(config_path, "r") as config_file:
+                config_data = json.load(config_file)
+                config_data["train"]["fp16_run"] = fp16_run
+                json.dump(config_data, f, indent=4)
 
-        npys = [np.load(f"{feature_dir}/{name}") for name in os.listdir(feature_dir)]
-        big_npy = np.concatenate(npys, axis=0)
-        
-        big_npy_idx = np.arange(big_npy.shape[0])
-        np.random.shuffle(big_npy_idx)
-        big_npy = big_npy[big_npy_idx]
+        # Run the training process
+        training_command = [
+            "python", "infer/modules/train/train.py",
+            "-e", model_name, "-sr", sample_rate, "-f0", "1", "-bs", str(batch_size),
+            "-te", epochs, "-se", save_epoch,
+            "-pg", G_file, "-pd", D_file
+        ]
 
-        if big_npy.shape[0] > 200000:
-            big_npy = MiniBatchKMeans(n_clusters=10000, verbose=True, batch_size=256 * cpu_count(), compute_labels=False, init="random").fit(big_npy).cluster_centers_
-
-        n_ivf = min(int(16 * np.sqrt(big_npy.shape[0])), big_npy.shape[0] // 39)
-        index = faiss.index_factory(256 if version == "v1" else 768, f"IVF{n_ivf},Flat")
-        index.train(big_npy)
-        index.add(big_npy)
-
-        faiss.write_index(index, f"{exp_dir}/trained_IVF{n_ivf}_Flat.index")
-        return "Index training completed successfully!"
+        subprocess.run(training_command, check=True)
+        return "Model training started successfully!"
     except Exception as e:
-        return f"Error: {str(e)}"
+        return str(e)
 
-def start_training(model_name, epochs, batch_size, fp16_run):
-    try:
-        exp_dir = f"logs/{model_name}"
-        os.makedirs(exp_dir, exist_ok=True)
-        # Example: Simulated training command
-        subprocess.run(["echo", f"Training model: {model_name} for {epochs} epochs with batch size {batch_size}. FP16: {fp16_run}"])
-        return "Training started! Check logs for progress."
-    except Exception as e:
-        return f"Error: {str(e)}"
 
 # Gradio Interface
-def main_interface():
-    with gr.Blocks() as demo:
-        gr.Markdown("# Train Voc ModeL WebUI")
+with gr.Blocks() as demo:
+    gr.Markdown("### Model Training WebUI")
+    
+    with gr.Tab("Data Processing"):
+        model_name = gr.Textbox(label="Model Name", placeholder="Enter model name")
+        dataset_folder = gr.Textbox(label="Dataset Folder", value="/content/dataset")
+        sample_rate = gr.Radio(["32k", "40k", "48k"], value="40k", label="Sample Rate")
+        is_half = gr.Checkbox(value=True, label="Memory Saving")
+        new_preprocess = gr.Checkbox(value=False, label="Use New Preprocess")
+        percentage = gr.Slider(0.1, 10.0, value=3.7, label="Percentage")
+        
+        process_button = gr.Button("Start Data Processing")
+        process_output = gr.Textbox(label="Output")
 
-        with gr.Tab("Data Preprocessing"):
-            model_name = gr.Textbox(label="Model Name", placeholder="Enter model name", value="")
-            dataset_folder = gr.Textbox(label="Dataset Folder Path", placeholder="/path/to/dataset")
-            sample_rate = gr.Radio(label="Sample Rate", choices=["32k", "40k", "48k"], value="40k")
-            is_half = gr.Checkbox(label="Memory Saving", value=True)
-            new_preprocess = gr.Checkbox(label="Improved Preprocessing (Experimental)", value=False)
-            percentage = gr.Slider(label="Percentage", minimum=1, maximum=100, value=3.7)
-            preprocess_btn = gr.Button("Start Preprocessing")
-            preprocess_output = gr.Textbox(label="Output")
+        process_button.click(
+            data_processing, 
+            inputs=[model_name, dataset_folder, sample_rate, is_half, new_preprocess, percentage],
+            outputs=process_output
+        )
 
-            preprocess_btn.click(
-                preprocess_dataset,
-                inputs=[model_name, dataset_folder, sample_rate, is_half, new_preprocess, percentage],
-                outputs=preprocess_output
-            )
+    with gr.Tab("Model Training"):
+        epochs = gr.Number(value=500, label="Epochs")
+        save_epoch = gr.Number(value=50, label="Save Epoch Frequency")
+        pretrain = gr.Radio(
+            [
+                "* Default —> (Sampling — ALL)", "* Snowie —> (Sampling — 40k)", 
+                "* Ov2Super —> (Sampling — 40k)"
+            ], value="* Default —> (Sampling — ALL)", label="Pretrained Model"
+        )
+        custom_pretrained = gr.Checkbox(value=False, label="Use Custom Pretrained")
+        d_pretrained_link = gr.Textbox(label="D Pretrained Link")
+        g_pretrained_link = gr.Textbox(label="G Pretrained Link")
+        batch_size = gr.Slider(4, 32, step=4, value=8, label="Batch Size")
+        fp16_run = gr.Checkbox(value=True, label="Enable FP16")
+        tensorboard = gr.Checkbox(value=False, label="Enable TensorBoard")
 
-        with gr.Tab("Index Training"):
-            index_version = gr.Radio(label="Version", choices=["v1", "v2"], value="v2")
-            train_index_btn = gr.Button("Train Index")
-            index_output = gr.Textbox(label="Output")
+        train_button = gr.Button("Start Model Training")
+        train_output = gr.Textbox(label="Output")
 
-            train_index_btn.click(train_index, inputs=[model_name, index_version], outputs=index_output)
+        train_button.click(
+            model_training, 
+            inputs=[
+                model_name, sample_rate, epochs, save_epoch, pretrain, 
+                custom_pretrained, d_pretrained_link, g_pretrained_link, 
+                batch_size, fp16_run, tensorboard
+            ], outputs=train_output
+        )
 
-        with gr.Tab("Model Training"):
-            epochs = gr.Textbox(label="Total Epochs", placeholder="500", value="500")
-            batch_size = gr.Slider(label="Batch Size", minimum=4, maximum=32, step=4, value=8)
-            fp16_run = gr.Checkbox(label="Use FP16", value=True)
-            train_btn = gr.Button("Start Training")
-            train_output = gr.Textbox(label="Output")
-
-            train_btn.click(start_training, inputs=[model_name, epochs, batch_size, fp16_run], outputs=train_output)
-
-    return demo
-
-demo = main_interface()
 demo.launch()
